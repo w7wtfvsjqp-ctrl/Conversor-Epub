@@ -328,7 +328,7 @@
   </div>
 
   <footer class="note">
-    <strong>Como funciona:</strong> tudo é processado localmente no seu navegador — o PDF nunca sai do seu computador. Funciona melhor com PDFs de texto (não escaneados/OCR). Kindles atuais abrem EPUB diretamente pelo app ou pelo "Enviar para o Kindle"; aparelhos mais antigos convertem automaticamente ao receber o arquivo por e‑mail.
+    <strong>Como funciona:</strong> tudo é processado localmente no seu navegador — o PDF nunca sai do seu computador. O texto é extraído e reorganizado em capítulos; imagens e ilustrações são recortadas de cada página e reinseridas na posição onde apareciam. Funciona melhor com PDFs de texto (não escaneados/OCR — nesse caso, a página inteira é uma "imagem" e não há texto para extrair). Kindles atuais abrem EPUB diretamente pelo app ou pelo "Enviar para o Kindle"; aparelhos mais antigos convertem automaticamente ao receber o arquivo por e‑mail.
   </footer>
 
 </div>
@@ -441,12 +441,43 @@ coverInput.addEventListener('change', e=>{
   reader.readAsDataURL(f);
 });
 
-// ---------- PDF text extraction ----------
-async function extractLines(pdfDoc, onPage){
+// ---------- PDF text + image extraction ----------
+function dataUrlToUint8Array(dataUrl){
+  const base64 = dataUrl.split(',')[1];
+  const binary = atob(base64);
+  const arr = new Uint8Array(binary.length);
+  for (let i=0;i<binary.length;i++) arr[i] = binary.charCodeAt(i);
+  return arr;
+}
+
+// Extracts text lines AND embedded raster images, interleaved in reading order.
+// Images are located by walking the page's operator list to get each image's
+// placement rectangle (in PDF user space), then the page is rasterized once
+// and each rectangle is cropped out of the raster — this works regardless of
+// the internal pdf.js image object format, which varies across versions.
+async function extractContent(pdfDoc, onPage, onImage){
   const numPages = pdfDoc.numPages;
-  const allLines = [];
+  const allEntries = [];
+  let imgCounter = 0;
+  const OPS = pdfjsLib.OPS;
+
+  function mul(m1, m2){
+    // concatenation matching PDF "cm" semantics: CTM_new = m1 x CTM_old
+    return [
+      m1[0]*m2[0] + m1[1]*m2[2],
+      m1[0]*m2[1] + m1[1]*m2[3],
+      m1[2]*m2[0] + m1[3]*m2[2],
+      m1[2]*m2[1] + m1[3]*m2[3],
+      m1[4]*m2[0] + m1[5]*m2[2] + m2[4],
+      m1[4]*m2[1] + m1[5]*m2[3] + m2[5]
+    ];
+  }
+
   for (let p=1; p<=numPages; p++){
     const page = await pdfDoc.getPage(p);
+    const pageEntries = [];
+
+    // ---- text lines ----
     const content = await page.getTextContent();
     let lines = [];
     let current = null;
@@ -467,10 +498,86 @@ async function extractLines(pdfDoc, onPage){
       lastY = y;
     }
     if (current) lines.push(current);
-    lines.forEach(l => allLines.push({...l, page: p}));
+    lines.forEach(l => pageEntries.push({ type:'text', text:l.text, y:l.y, maxFont:l.maxFont, page:p }));
+
+    // ---- image placement rectangles (in PDF user space) ----
+    const opList = await page.getOperatorList();
+    let stack = [];
+    let m = [1,0,0,1,0,0];
+    const boxes = [];
+    for (let i=0;i<opList.fnArray.length;i++){
+      const fn = opList.fnArray[i];
+      const args = opList.argsArray[i];
+      if (fn === OPS.save){
+        stack.push(m.slice());
+      } else if (fn === OPS.restore){
+        m = stack.pop() || [1,0,0,1,0,0];
+      } else if (fn === OPS.transform){
+        m = mul(args, m);
+      } else if (fn === OPS.paintImageXObject || fn === OPS.paintJpegXObject){
+        const pts = [[0,0],[1,0],[0,1],[1,1]].map(([u,v])=>[
+          m[0]*u + m[2]*v + m[4],
+          m[1]*u + m[3]*v + m[5]
+        ]);
+        const xs = pts.map(pt=>pt[0]), ys = pts.map(pt=>pt[1]);
+        const minX=Math.min(...xs), maxX=Math.max(...xs), minY=Math.min(...ys), maxY=Math.max(...ys);
+        // skip tiny images: decorative bullets, rules, icons
+        if ((maxX-minX) > 20 && (maxY-minY) > 20){
+          boxes.push({minX,maxX,minY,maxY});
+        }
+      }
+    }
+
+    // ---- rasterize page once and crop each image rectangle out of it ----
+    if (boxes.length){
+      const scale = 2.0;
+      const viewport = page.getViewport({ scale });
+      const pageCanvas = document.createElement('canvas');
+      pageCanvas.width = Math.ceil(viewport.width);
+      pageCanvas.height = Math.ceil(viewport.height);
+      const ctx = pageCanvas.getContext('2d');
+      await page.render({ canvasContext: ctx, viewport }).promise;
+
+      for (const bbox of boxes){
+        const c1 = viewport.convertToViewportPoint(bbox.minX, bbox.minY);
+        const c2 = viewport.convertToViewportPoint(bbox.maxX, bbox.maxY);
+        const sx = Math.max(0, Math.min(c1[0], c2[0]));
+        const sy = Math.max(0, Math.min(c1[1], c2[1]));
+        const sw = Math.min(pageCanvas.width - sx, Math.abs(c2[0]-c1[0]));
+        const sh = Math.min(pageCanvas.height - sy, Math.abs(c2[1]-c1[1]));
+        if (sw < 8 || sh < 8) continue;
+
+        let outW = sw, outH = sh;
+        const maxDim = 1100;
+        if (outW > maxDim){ outH = outH * (maxDim/outW); outW = maxDim; }
+        if (outH > maxDim){ outW = outW * (maxDim/outH); outH = maxDim; }
+
+        const crop = document.createElement('canvas');
+        crop.width = Math.max(1, Math.round(outW));
+        crop.height = Math.max(1, Math.round(outH));
+        crop.getContext('2d').drawImage(pageCanvas, sx, sy, sw, sh, 0, 0, crop.width, crop.height);
+
+        imgCounter++;
+        pageEntries.push({
+          type:'image',
+          y: (bbox.minY+bbox.maxY)/2,
+          page: p,
+          dataUrl: crop.toDataURL('image/jpeg', 0.82),
+          width: crop.width,
+          height: crop.height,
+          name: 'img' + String(imgCounter).padStart(3,'0') + '.jpg'
+        });
+      }
+      if (onImage) onImage(p, boxes.length);
+    }
+
+    // interleave text and images in reading order (top of page first)
+    pageEntries.sort((a,b)=> b.y - a.y);
+    allEntries.push(...pageEntries);
+
     onPage(p, numPages);
   }
-  return allLines;
+  return allEntries;
 }
 
 function pushLine(buf, text){
@@ -484,9 +591,10 @@ function pushLine(buf, text){
   buf.push(text);
 }
 
-function buildChapters(allLines, opts){
+function buildChapters(allEntries, opts){
+  const textEntries = allEntries.filter(e=>e.type==='text');
   const sizeCounts = {};
-  allLines.forEach(l=>{
+  textEntries.forEach(l=>{
     if (l.text.trim().length > 15){
       const s = Math.round(l.maxFont);
       sizeCounts[s] = (sizeCounts[s]||0) + 1;
@@ -498,53 +606,61 @@ function buildChapters(allLines, opts){
   }
 
   const chapters = [];
-  let current = { title: 'Início', paragraphs: [] };
+  // blocks: {type:'text', content} or {type:'image', name, dataUrl, width, height}
+  let current = { title: 'Início', blocks: [] };
   let paragraphBuf = [];
   let prevY = null, prevPage = null;
   let lastChapterStartPage = 1;
 
   function flushParagraph(){
     if (paragraphBuf.length){
-      current.paragraphs.push(paragraphBuf.join(' ').replace(/\s+/g,' ').trim());
+      current.blocks.push({ type:'text', content: paragraphBuf.join(' ').replace(/\s+/g,' ').trim() });
       paragraphBuf = [];
     }
   }
   function startChapter(title, page){
     flushParagraph();
-    if (current.paragraphs.length) chapters.push(current);
-    current = { title, paragraphs: [] };
+    if (current.blocks.length) chapters.push(current);
+    current = { title, blocks: [] };
     lastChapterStartPage = page;
   }
 
-  allLines.forEach(l=>{
-    const text = l.text.trim();
-    if (!text) return;
-
-    if (opts.forceSplit){
-      if (l.page !== prevPage && (l.page - lastChapterStartPage) >= opts.pagesPerChapter){
-        startChapter('Capítulo ' + (chapters.length+2), l.page);
-      }
-      pushLine(paragraphBuf, text);
-      prevY = l.y; prevPage = l.page;
+  allEntries.forEach(entry=>{
+    if (entry.type === 'image'){
+      flushParagraph();
+      current.blocks.push({ type:'image', name:entry.name, dataUrl:entry.dataUrl, width:entry.width, height:entry.height });
+      prevPage = entry.page;
       return;
     }
 
-    const isHeading = l.maxFont > baseSize * 1.25 && text.length < 90 && text.length > 1;
-    const samePage = prevPage === l.page;
-    const gap = samePage && prevY !== null ? (prevY - l.y) : null;
+    const text = entry.text.trim();
+    if (!text) return;
+
+    if (opts.forceSplit){
+      if (entry.page !== prevPage && (entry.page - lastChapterStartPage) >= opts.pagesPerChapter){
+        startChapter('Capítulo ' + (chapters.length+2), entry.page);
+      }
+      pushLine(paragraphBuf, text);
+      prevY = entry.y; prevPage = entry.page;
+      return;
+    }
+
+    const isHeading = entry.maxFont > baseSize * 1.25 && text.length < 90 && text.length > 1;
+    const samePage = prevPage === entry.page;
+    const gap = samePage && prevY !== null ? (prevY - entry.y) : null;
     const bigGap = gap !== null && gap > baseSize * 1.7;
 
     if (isHeading){
-      startChapter(text, l.page);
+      startChapter(text, entry.page);
     } else {
       if (bigGap) flushParagraph();
       pushLine(paragraphBuf, text);
     }
-    prevY = l.y; prevPage = l.page;
+    prevY = entry.y; prevPage = entry.page;
   });
   flushParagraph();
-  if (current.paragraphs.length) chapters.push(current);
-  if (chapters.length === 0) chapters.push({ title:'Conteúdo', paragraphs:['(Não foi possível extrair texto deste PDF — ele pode ser um documento escaneado sem OCR.)'] });
+  if (current.blocks.length) chapters.push(current);
+  if (chapters.length === 0) chapters.push({ title:'Conteúdo', blocks:[{type:'text', content:'(Não foi possível extrair conteúdo deste PDF — ele pode ser um documento escaneado sem OCR.)'}] });
   return chapters;
 }
 
@@ -571,6 +687,8 @@ async function buildEpub(chapters, meta, coverBytes, coverExt, coverMime){
 `body{font-family:Georgia,"Times New Roman",serif;line-height:1.6;margin:0 5%;}
 h1{font-size:1.5em;margin:2em 0 1em;text-align:center;}
 p{margin:0 0 1em;text-indent:1.4em;text-align:justify;}
+.illustration{margin:1.5em 0;text-align:center;}
+.illustration img{max-width:100%;height:auto;}
 .cover{text-align:center;margin:0;padding:0;}
 .cover img{max-width:100%;max-height:100vh;}`);
 
@@ -600,17 +718,26 @@ p{margin:0 0 1em;text-indent:1.4em;text-align:justify;}
 </html>`);
   }
 
+  let imageManifestCount = 0;
   chapters.forEach((ch, i)=>{
     const id = 'chap' + String(i+1).padStart(3,'0');
     const href = id + '.xhtml';
-    const bodyParas = ch.paragraphs.map(p => `<p>${escapeXhtml(p)}</p>`).join('\n');
+    const bodyHtml = ch.blocks.map(b=>{
+      if (b.type === 'image'){
+        oebps.folder('images').file(b.name, dataUrlToUint8Array(b.dataUrl), { binary:true });
+        imageManifestCount++;
+        manifestItems.push(`<item id="img-${b.name.replace(/\W/g,'')}" href="images/${b.name}" media-type="image/jpeg"/>`);
+        return `<div class="illustration"><img src="images/${b.name}" alt=""/></div>`;
+      }
+      return `<p>${escapeXhtml(b.content)}</p>`;
+    }).join('\n');
     oebps.file(href,
 `<?xml version="1.0" encoding="UTF-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml">
 <head><title>${escapeXhtml(ch.title)}</title><link rel="stylesheet" type="text/css" href="style.css"/></head>
 <body>
 <h1>${escapeXhtml(ch.title)}</h1>
-${bodyParas}
+${bodyHtml}
 </body>
 </html>`);
     manifestItems.push(`<item id="${id}" href="${href}" media-type="application/xhtml+xml"/>`);
@@ -680,17 +807,23 @@ convertBtn.addEventListener('click', async ()=>{
     const pdfDoc = await pdfjsLib.getDocument({ data: buf }).promise;
     log('PDF carregado — ' + pdfDoc.numPages + ' página(s).', 'ok');
 
-    const allLines = await extractLines(pdfDoc, (p, total)=>{
-      setProgress((p/total)*70, `Extraindo texto… página ${p}/${total}`);
-    });
+    const allEntries = await extractContent(
+      pdfDoc,
+      (p, total)=> setProgress((p/total)*70, `Extraindo texto e imagens… página ${p}/${total}`),
+      (p, count)=> log(`Página ${p}: ${count} imagem(ns) encontrada(s).`)
+    );
 
-    const totalChars = allLines.reduce((a,l)=>a + l.text.length, 0);
+    const totalChars = allEntries.filter(e=>e.type==='text').reduce((a,l)=>a + l.text.length, 0);
+    const totalImages = allEntries.filter(e=>e.type==='image').length;
     if (totalChars < 200){
       log('Aviso: pouquíssimo texto encontrado. Este PDF pode ser escaneado (imagem), sem camada de texto/OCR.', 'warn');
     }
+    if (totalImages > 0){
+      log('Total de ilustrações extraídas: ' + totalImages, 'ok');
+    }
 
     setProgress(75, 'Organizando capítulos…');
-    const chapters = buildChapters(allLines, {
+    const chapters = buildChapters(allEntries, {
       forceSplit: forceSplit.checked,
       pagesPerChapter: Math.max(1, parseInt(pagesPerChapter.value,10) || 15)
     });
@@ -721,8 +854,9 @@ convertBtn.addEventListener('click', async ()=>{
     setProgress(100, 'Concluído');
     log('EPUB gerado (' + humanSize(blob.size) + ').', 'ok');
 
-    const wordCount = chapters.reduce((a,c)=> a + c.paragraphs.join(' ').split(/\s+/).length, 0);
-    resultSummary.textContent = `${chapters.length} capítulo(s) · ~${wordCount.toLocaleString('pt-BR')} palavras · ${humanSize(blob.size)}`;
+    const wordCount = chapters.reduce((a,c)=> a + c.blocks.filter(b=>b.type==='text').map(b=>b.content).join(' ').split(/\s+/).filter(Boolean).length, 0);
+    const imgSummary = totalImages > 0 ? ` · ${totalImages} imagem(ns)` : '';
+    resultSummary.textContent = `${chapters.length} capítulo(s) · ~${wordCount.toLocaleString('pt-BR')} palavras${imgSummary} · ${humanSize(blob.size)}`;
     resultEl.classList.add('show');
   } catch(err){
     console.error(err);
