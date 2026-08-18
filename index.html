@@ -479,6 +479,7 @@ async function extractContent(pdfDoc, onPage, onImage){
 
     // ---- text lines ----
     const content = await page.getTextContent();
+    const styles = content.styles || {};
     let lines = [];
     let current = null;
     let lastY = null;
@@ -487,18 +488,27 @@ async function extractContent(pdfDoc, onPage, onImage){
       if (it.str === undefined) continue;
       const y = it.transform[5];
       const fontSize = Math.hypot(it.transform[2], it.transform[3]) || Math.abs(it.transform[3]) || 10;
+      const style = styles[it.fontName];
+      const family = (style && style.fontFamily) ? String(style.fontFamily).toLowerCase() : '';
+      const isMonoRun = family.includes('monospace');
+      const runLen = it.str.length || 0;
       if (current === null || Math.abs(y - lastY) > yTol){
         if (current) lines.push(current);
-        current = { text: it.str, y, maxFont: fontSize };
+        current = { text: it.str, y, maxFont: fontSize, monoChars: isMonoRun ? runLen : 0, totalChars: runLen };
       } else {
         const needsSpace = !(current.text.endsWith(' ') || it.str.startsWith(' '));
         current.text += (needsSpace ? ' ' : '') + it.str;
         current.maxFont = Math.max(current.maxFont, fontSize);
+        current.monoChars += isMonoRun ? runLen : 0;
+        current.totalChars += runLen;
       }
       lastY = y;
     }
     if (current) lines.push(current);
-    lines.forEach(l => pageEntries.push({ type:'text', text:l.text, y:l.y, maxFont:l.maxFont, page:p }));
+    lines.forEach(l => pageEntries.push({
+      type:'text', text:l.text, y:l.y, maxFont:l.maxFont, page:p,
+      isCode: l.totalChars > 0 && (l.monoChars / l.totalChars) > 0.5
+    }));
 
     // ---- image placement rectangles (in PDF user space) ----
     const opList = await page.getOperatorList();
@@ -592,7 +602,7 @@ function pushLine(buf, text){
 }
 
 function buildChapters(allEntries, opts){
-  const textEntries = allEntries.filter(e=>e.type==='text');
+  const textEntries = allEntries.filter(e=>e.type==='text' && !e.isCode);
   const sizeCounts = {};
   textEntries.forEach(l=>{
     if (l.text.trim().length > 15){
@@ -606,9 +616,10 @@ function buildChapters(allEntries, opts){
   }
 
   const chapters = [];
-  // blocks: {type:'text', content} or {type:'image', name, dataUrl, width, height}
+  // blocks: {type:'text', content} | {type:'code', content} | {type:'image', ...}
   let current = { title: 'Início', blocks: [] };
   let paragraphBuf = [];
+  let codeBuf = [];
   let prevY = null, prevPage = null;
   let lastChapterStartPage = 1;
 
@@ -618,8 +629,15 @@ function buildChapters(allEntries, opts){
       paragraphBuf = [];
     }
   }
+  function flushCode(){
+    if (codeBuf.length){
+      current.blocks.push({ type:'code', content: codeBuf.join('\n') });
+      codeBuf = [];
+    }
+  }
+  function flushAll(){ flushParagraph(); flushCode(); }
   function startChapter(title, page){
-    flushParagraph();
+    flushAll();
     if (current.blocks.length) chapters.push(current);
     current = { title, blocks: [] };
     lastChapterStartPage = page;
@@ -627,7 +645,7 @@ function buildChapters(allEntries, opts){
 
   allEntries.forEach(entry=>{
     if (entry.type === 'image'){
-      flushParagraph();
+      flushAll();
       current.blocks.push({ type:'image', name:entry.name, dataUrl:entry.dataUrl, width:entry.width, height:entry.height });
       prevPage = entry.page;
       return;
@@ -635,6 +653,14 @@ function buildChapters(allEntries, opts){
 
     const text = entry.text.trim();
     if (!text) return;
+
+    if (entry.isCode){
+      flushParagraph();
+      codeBuf.push(entry.text.replace(/\s+$/,''));
+      prevY = entry.y; prevPage = entry.page;
+      return;
+    }
+    flushCode();
 
     if (opts.forceSplit){
       if (entry.page !== prevPage && (entry.page - lastChapterStartPage) >= opts.pagesPerChapter){
@@ -658,14 +684,18 @@ function buildChapters(allEntries, opts){
     }
     prevY = entry.y; prevPage = entry.page;
   });
-  flushParagraph();
+  flushAll();
   if (current.blocks.length) chapters.push(current);
   if (chapters.length === 0) chapters.push({ title:'Conteúdo', blocks:[{type:'text', content:'(Não foi possível extrair conteúdo deste PDF — ele pode ser um documento escaneado sem OCR.)'}] });
   return chapters;
 }
 
 function escapeXhtml(s){
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  // Strip characters not allowed in XML 1.0 (control chars, stray nulls from
+  // buggy embedded font ToUnicode maps) before escaping entities — this is
+  // what caused "Char 0x0 out of allowed range" parse errors on some pages.
+  const clean = String(s).replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
+  return clean.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
 // ---------- EPUB building ----------
@@ -687,6 +717,20 @@ async function buildEpub(chapters, meta, coverBytes, coverExt, coverMime){
 `body{font-family:Georgia,"Times New Roman",serif;line-height:1.6;margin:0 5%;}
 h1{font-size:1.5em;margin:2em 0 1em;text-align:center;}
 p{margin:0 0 1em;text-indent:1.4em;text-align:justify;}
+pre.code{
+  font-family:"Courier New",monospace;
+  font-size:0.82em;
+  line-height:1.45;
+  background:#f0f0f0;
+  border:1px solid #cccccc;
+  border-radius:4px;
+  padding:0.8em 1em;
+  margin:0 0 1.2em;
+  white-space:pre-wrap;
+  word-wrap:break-word;
+  text-align:left;
+}
+pre.code code{white-space:pre-wrap;}
 .illustration{margin:1.5em 0;text-align:center;}
 .illustration img{max-width:100%;height:auto;}
 .cover{text-align:center;margin:0;padding:0;}
@@ -728,6 +772,9 @@ p{margin:0 0 1em;text-indent:1.4em;text-align:justify;}
         imageManifestCount++;
         manifestItems.push(`<item id="img-${b.name.replace(/\W/g,'')}" href="images/${b.name}" media-type="image/jpeg"/>`);
         return `<div class="illustration"><img src="images/${b.name}" alt=""/></div>`;
+      }
+      if (b.type === 'code'){
+        return `<pre class="code"><code>${escapeXhtml(b.content)}</code></pre>`;
       }
       return `<p>${escapeXhtml(b.content)}</p>`;
     }).join('\n');
